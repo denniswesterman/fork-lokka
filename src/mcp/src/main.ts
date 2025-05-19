@@ -2,11 +2,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ClientSecretCredential } from "@azure/identity";
+import { ClientSecretCredential, ClientCertificateCredential, DefaultAzureCredential } from "@azure/identity";
 import { Client, PageIterator, PageCollection } from "@microsoft/microsoft-graph-client";
 import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials/index.js";
 import fetch from 'isomorphic-fetch'; // Required polyfill for Graph client
 import { logger } from "./logger.js";
+import { existsSync } from 'fs';
 
 // Set up global fetch for the Microsoft Graph client
 (global as any).fetch = fetch;
@@ -21,7 +22,7 @@ logger.info("Starting Lokka Multi-Microsoft API MCP Server (v0.1.9 - Refactored 
 
 // Initialize Graph Client and Azure Auth Credential outside the tool function
 let graphClient: Client | null = null;
-let azureCredential: ClientSecretCredential | null = null; // For Azure RM calls
+let azureCredential: ClientSecretCredential | ClientCertificateCredential | DefaultAzureCredential | null = null; // For Azure RM calls
 
 server.tool(
   "Lokka-Microsoft",
@@ -291,18 +292,13 @@ server.tool(
 
 // Start the server with stdio transport
 async function main() {
-  // Check for required environment variables
-  const tenantId = process.env.TENANT_ID;
-  const clientId = process.env.CLIENT_ID;
-  const clientSecret = process.env.CLIENT_SECRET;
-
-  if (!tenantId || !clientId || !clientSecret) {
-    logger.error("Missing required environment variables: TENANT_ID, CLIENT_ID, or CLIENT_SECRET");
-    throw new Error("Missing required environment variables: TENANT_ID, CLIENT_ID, or CLIENT_SECRET");
+  // Initialize Azure Credential based on available authentication options
+  azureCredential = await initializeAuthentication();
+  
+  if (!azureCredential) {
+    logger.error("Failed to initialize any authentication method");
+    throw new Error("Failed to initialize any authentication method");
   }
-
-  // Initialize Azure Credential
-  azureCredential = new ClientSecretCredential(tenantId, clientId, clientSecret);
 
   // Initialize Graph Authentication Provider
   const authProvider = new TokenCredentialAuthenticationProvider(azureCredential, {
@@ -318,6 +314,50 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+/**
+ * Initializes authentication using available methods in order of preference:
+ * 1. Certificate-based authentication
+ * 2. Secret-based authentication
+ * 3. DefaultAzureCredential
+ */
+async function initializeAuthentication() {
+  const tenantId = process.env.TENANT_ID;
+  const clientId = process.env.CLIENT_ID;
+  
+  if (!tenantId || !clientId) {
+    logger.error("Missing required environment variables: TENANT_ID or CLIENT_ID");
+    throw new Error("Missing required environment variables: TENANT_ID or CLIENT_ID");
+  }
+  
+  // Option 1: Try certificate-based authentication
+  const certPath = process.env.AZURE_CLIENT_CERTIFICATE_PATH;
+  const certPassword = process.env.AZURE_CLIENT_CERTIFICATE_PASSWORD;
+  
+  if (certPath && existsSync(certPath)) {
+    logger.info("Using certificate-based authentication");
+    const options = certPassword 
+      ? { certificatePath: certPath, password: certPassword } 
+      : { certificatePath: certPath };
+    return new ClientCertificateCredential(tenantId, clientId, options);
+  }
+  
+  // Option 2: Fall back to client secret if provided
+  const clientSecret = process.env.CLIENT_SECRET || process.env.AZURE_CLIENT_SECRET;
+  if (clientSecret) {
+    logger.info("Using client secret authentication");
+    return new ClientSecretCredential(tenantId, clientId, clientSecret);
+  }
+  
+  // Option 3: Try DefaultAzureCredential as a last resort
+  logger.info("Attempting to use DefaultAzureCredential");
+  try {
+    return new DefaultAzureCredential();
+  } catch (error) {
+    logger.error("Failed to initialize DefaultAzureCredential", error);
+    throw new Error("No valid authentication method available");
+  }
 }
 
 main().catch((error) => {
